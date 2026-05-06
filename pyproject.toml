@@ -24,8 +24,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/mahadirahmad/claude-desktop-deepseek-launcher"
-Issues = "https://github.com/mahadirahmad/claude-desktop-deepseek-launcher/issues"
+Homepage = "https://github.com/mahadirz/claude-desktop-deepseek-launcher"
+Issues = "https://github.com/mahadirz/claude-desktop-deepseek-launcher/issues"
 
 [project.scripts]
 claude-deepseek-launcher = "claude_deepseek_launcher.__main__:main"

@@ -24,7 +24,7 @@ Tested on macOS with Claude Desktop 3P mode. Windows paths are implemented but n
 Clone the repo:
 
 ```bash
-git clone https://github.com/mahadirahmad/claude-desktop-deepseek-launcher.git
+git clone https://github.com/mahadirz/claude-desktop-deepseek-launcher.git
 cd claude-desktop-deepseek-launcher
 ```
 
