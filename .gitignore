@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+dist/
+build/
+.DS_Store
+
+# Local secrets and runtime logs.
+.env
+*.log
+proxy.pid
