@@ -266,9 +266,9 @@ def open_claude() -> None:
     raise LaunchError("Cannot open Claude Desktop on this platform")
 
 
-def deepseek_headers_from_incoming() -> dict[str, str]:
+def deepseek_headers_from_incoming(accept: str | None = None) -> dict[str, str]:
     return {
-        "Accept": "application/json",
+        "Accept": accept or "application/json",
         "Content-Type": "application/json",
     }
 
@@ -294,6 +294,18 @@ def sanitize_user_id_value(value: Any) -> str:
     if not candidate:
         return "claude_desktop"
     return candidate[:128]
+
+
+def estimate_input_tokens(value: Any) -> int:
+    if isinstance(value, str):
+        return max(1, len(value) // 4)
+    if isinstance(value, dict):
+        return sum(estimate_input_tokens(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(estimate_input_tokens(item) for item in value)
+    if value is None:
+        return 0
+    return max(1, len(str(value)) // 4)
 
 
 class DeepSeekProxyHandler(BaseHTTPRequestHandler):
@@ -322,8 +334,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
             return
         self.send_error(404, "not found")
 
@@ -332,13 +347,15 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if path in {"", "/", "/v1", "/v1/models"}:
             self.send_response(200)
             self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
             self.end_headers()
+            self.close_connection = True
             return
         self.send_error(404, "not found")
 
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path.rstrip("/")
-        if path != "/v1/messages":
+        if path not in {"/v1/messages", "/v1/messages/count_tokens"}:
             self.send_error(404, "not found")
             return
 
@@ -350,12 +367,24 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             self.send_error(400, "invalid json")
             return
 
+        if path == "/v1/messages/count_tokens":
+            response = json.dumps({"input_tokens": estimate_input_tokens(body)}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(response)
+            self.wfile.flush()
+            self.close_connection = True
+            return
+
         forwarded = json.dumps(sanitize_user_ids(body), separators=(",", ":")).encode("utf-8")
         req = urllib.request.Request(
             DEFAULT_BASE_URL + "/v1/messages",
             data=forwarded,
             method="POST",
-            headers=deepseek_headers_from_incoming(),
+            headers=deepseek_headers_from_incoming(self.headers.get("Accept")),
         )
 
         auth = self.headers.get("Authorization")
@@ -376,19 +405,35 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         try:
             with urllib.request.urlopen(req, timeout=None) as resp:
                 self.send_response(resp.status)
+                content_type = resp.headers.get("Content-Type", "application/json")
                 for key, value in resp.headers.items():
                     if key.lower() in {"connection", "transfer-encoding", "content-encoding"}:
                         continue
                     self.send_header(key, value)
+                self.send_header("Connection", "close")
                 self.end_headers()
-                shutil.copyfileobj(resp, self.wfile)
+                if content_type.startswith("text/event-stream"):
+                    for line in resp:
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                else:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                self.close_connection = True
         except urllib.error.HTTPError as exc:
             data = exc.read()
             self.send_response(exc.code)
             self.send_header("Content-Type", exc.headers.get("Content-Type", "application/json"))
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(data)
+            self.wfile.flush()
+            self.close_connection = True
 
 
 def serve_proxy(host: str, port: int) -> int:

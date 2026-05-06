@@ -1,6 +1,7 @@
 import unittest
 
 from claude_deepseek_launcher.__main__ import (
+    estimate_input_tokens,
     normalize_api_key,
     sanitize_user_id_value,
     sanitize_user_ids,
@@ -33,6 +34,13 @@ class LauncherHelpersTest(unittest.TestCase):
                 "unchanged": "bad/value",
             },
         )
+
+    def test_estimate_input_tokens_counts_nested_content(self) -> None:
+        self.assertGreater(
+            estimate_input_tokens({"messages": [{"content": "hello world"}]}),
+            0,
+        )
+        self.assertEqual(estimate_input_tokens(None), 0)
 
 
 if __name__ == "__main__":

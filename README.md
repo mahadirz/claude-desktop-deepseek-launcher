@@ -45,6 +45,12 @@ DeepSeek 4 Flash
 
 Start a new conversation and send a prompt.
 
+## Screenshot
+
+Claude Desktop running in Cowork 3P mode through the DeepSeek gateway:
+
+![Claude Desktop Cowork 3P with DeepSeek models](docs/assets/claude-desktop-deepseek-cowork.png)
+
 ## Install As A CLI
 
 From the repo directory:
@@ -162,6 +168,8 @@ The default local proxy fixes those compatibility issues by:
 
 - using `Authorization: Bearer sk-...`
 - accepting Claude Desktop's query-string forms, such as `/v1/models?limit=1000`
+- handling Claude Desktop's `/v1/messages/count_tokens` calls locally
+- flushing streamed responses and closing proxy connections cleanly
 - sanitizing `user_id` and `userid` values to DeepSeek's allowed pattern
 
 ## Troubleshooting
