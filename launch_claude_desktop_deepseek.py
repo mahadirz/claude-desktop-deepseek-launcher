@@ -2,11 +2,8 @@
 """
 Launch Claude Desktop Cowork on 3P using DeepSeek's Anthropic-compatible API.
 
-This mirrors the important parts of:
-
-    ollama launch claude-desktop
-
-but writes a DeepSeek gateway profile instead of an Ollama Cloud profile.
+This writes a DeepSeek gateway profile and starts a local compatibility proxy
+for Claude Desktop's 3P gateway mode.
 
 Set DEEPSEEK_API_KEY before running, or pass --api-key:
 
@@ -22,6 +19,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -40,9 +38,29 @@ DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic"
 DEFAULT_PROXY_HOST = "127.0.0.1"
 DEFAULT_PROXY_PORT = 17631
 DEFAULT_AUTH_SCHEME = "bearer"
+DEFAULT_CLAUDE_ROUTE_MODELS = ["claude-sonnet-4-5", "anthropic/claude-sonnet-4-5"]
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEFAULT_DISPLAY_MODEL_MAP = [
+    ("Claude Mythos Flash", "deepseek-v4-flash"),
+    ("Claude Mythos", "deepseek-v4-pro"),
+]
+DEFAULT_ROUTE_MODEL_MAP = {
+    route: upstream
+    for route, (_, upstream) in zip(DEFAULT_CLAUDE_ROUTE_MODELS, DEFAULT_DISPLAY_MODEL_MAP)
+}
+DEFAULT_AUTO_ALLOWED_TOOLS = [
+    "list_pages",
+    "select_page",
+    "navigate_page",
+    "take_snapshot",
+    "wait_for",
+    "click",
+    "fill",
+    "evaluate_script",
+]
 DEFAULT_MODELS: list[Any] = [
-    {"name": "deepseek-v4-pro", "supports1m": True},
-    "deepseek-v4-flash",
+    {"name": route, "labelOverride": label}
+    for route, (label, _) in zip(DEFAULT_CLAUDE_ROUTE_MODELS, DEFAULT_DISPLAY_MODEL_MAP)
 ]
 
 
@@ -57,6 +75,10 @@ def state_dir() -> Path:
         if local:
             root = Path(local) / "Claude-3p"
     return root / "deepseek-launcher"
+
+
+def route_model_map_path() -> Path:
+    return state_dir() / "model-routes.json"
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -137,12 +159,61 @@ def set_deployment_mode(path: Path, mode: str, dry_run: bool) -> None:
     write_json(path, cfg, dry_run)
 
 
+def managed_mcp_servers_from_config(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    managed_servers: list[dict[str, Any]] = []
+    mcp_servers = cfg.get("mcpServers")
+    if not isinstance(mcp_servers, dict):
+        return managed_servers
+
+    for name, server in mcp_servers.items():
+        if not isinstance(name, str) or not isinstance(server, dict):
+            continue
+        managed: dict[str, Any] = {
+            "name": name,
+            "transport": server.get("transport", "stdio"),
+        }
+        for key in ("command", "args", "env"):
+            if key in server:
+                managed[key] = server[key]
+        allowed_tools = server.get("alwaysAllow")
+        if not isinstance(allowed_tools, list):
+            allowed_tools = DEFAULT_AUTO_ALLOWED_TOOLS if name == "chrome-devtools" else []
+        if allowed_tools:
+            managed["toolPolicy"] = {
+                tool: "allow"
+                for tool in allowed_tools
+                if isinstance(tool, str)
+            }
+        managed_servers.append(managed)
+    return managed_servers
+
+
+def apply_cowork_auto_mode_config(path: Path, dry_run: bool) -> list[dict[str, Any]]:
+    cfg = read_json(path)
+    cfg["autoModeEnabled"] = True
+
+    preferences = cfg.setdefault("preferences", {})
+    if isinstance(preferences, dict):
+        bypass_by_account = preferences.get("bypassPermissionsGateByAccount")
+        if isinstance(bypass_by_account, dict):
+            for account_id in list(bypass_by_account):
+                bypass_by_account[account_id] = True
+
+    managed_servers = managed_mcp_servers_from_config(cfg)
+    if managed_servers:
+        cfg["managedMcpServers"] = managed_servers
+
+    write_json(path, cfg, dry_run)
+    return managed_servers
+
+
 def apply_profile(
     third_party_root: Path,
     api_key: str,
     base_url: str,
     auth_scheme: str,
     models: list[Any],
+    managed_mcp_servers: list[dict[str, Any]],
     dry_run: bool,
 ) -> None:
     meta_path = third_party_root / "configLibrary" / "_meta.json"
@@ -164,9 +235,12 @@ def apply_profile(
             "inferenceGatewayApiKey": api_key,
             "inferenceGatewayAuthScheme": auth_scheme,
             "inferenceModels": models,
+            "autoModeEnabled": True,
             "disableDeploymentModeChooser": True,
         }
     )
+    if managed_mcp_servers:
+        profile["managedMcpServers"] = managed_mcp_servers
     write_json(profile_path, profile, dry_run)
 
 
@@ -287,6 +361,62 @@ def sanitize_user_ids(value: Any) -> Any:
     return value
 
 
+def rewrite_model_routes(value: Any, upstream_model: str = DEFAULT_DEEPSEEK_MODEL) -> Any:
+    route_model_map = load_route_model_map()
+    return rewrite_model_routes_with_map(value, route_model_map, upstream_model)
+
+
+def rewrite_model_routes_with_map(
+    value: Any,
+    route_model_map: dict[str, str],
+    upstream_model: str = DEFAULT_DEEPSEEK_MODEL,
+) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "model" and isinstance(item, str) and is_claude_route_model(item):
+                out[key] = route_model_map.get(item, route_model_map.get(canonical_route_model(item), upstream_model))
+            else:
+                out[key] = rewrite_model_routes_with_map(item, route_model_map, upstream_model)
+        return out
+    if isinstance(value, list):
+        return [rewrite_model_routes_with_map(item, route_model_map, upstream_model) for item in value]
+    return value
+
+
+def is_claude_route_model(value: str) -> bool:
+    return value.startswith("claude-") or value.startswith("anthropic/claude-")
+
+
+def canonical_route_model(value: str) -> str:
+    if value.startswith("anthropic/"):
+        value = value[len("anthropic/") :]
+    if value.endswith("[1m]"):
+        value = value[: -len("[1m]")]
+    return value
+
+
+def load_route_model_map() -> dict[str, str]:
+    data = read_json(route_model_map_path())
+    routes = data.get("routes")
+    if not isinstance(routes, dict):
+        return dict(DEFAULT_ROUTE_MODEL_MAP)
+    out: dict[str, str] = {}
+    for route, upstream in routes.items():
+        if isinstance(route, str) and isinstance(upstream, str):
+            out[route] = upstream
+    return out or dict(DEFAULT_ROUTE_MODEL_MAP)
+
+
+def write_route_model_map(route_model_map: dict[str, str], dry_run: bool) -> None:
+    write_json(route_model_map_path(), {"routes": route_model_map}, dry_run)
+
+
+def current_model_routes() -> list[str]:
+    route_model_map = load_route_model_map()
+    return list(route_model_map.keys())
+
+
 def sanitize_user_id_value(value: Any) -> str:
     if not isinstance(value, str):
         return "claude_desktop"
@@ -325,8 +455,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             body = json.dumps(
                 {
                     "data": [
-                        {"id": model["name"] if isinstance(model, dict) else model, "type": "model"}
-                        for model in DEFAULT_MODELS
+                        {"id": route, "type": "model"}
+                        for route in current_model_routes()
                     ],
                     "object": "list",
                 }
@@ -379,7 +509,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
-        forwarded = json.dumps(sanitize_user_ids(body), separators=(",", ":")).encode("utf-8")
+        forwarded_body = rewrite_model_routes(sanitize_user_ids(body))
+        forwarded = json.dumps(forwarded_body, separators=(",", ":")).encode("utf-8")
         req = urllib.request.Request(
             DEFAULT_BASE_URL + "/v1/messages",
             data=forwarded,
@@ -390,7 +521,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization")
         x_api_key = self.headers.get("x-api-key")
         if auth:
-            req.add_header("Authorization", auth)
+            req.add_header("Authorization", "Bearer " + normalize_api_key(auth))
         elif x_api_key:
             req.add_header("Authorization", "Bearer " + normalize_api_key(x_api_key))
         else:
@@ -412,17 +543,20 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     self.send_header(key, value)
                 self.send_header("Connection", "close")
                 self.end_headers()
-                if content_type.startswith("text/event-stream"):
-                    for line in resp:
-                        self.wfile.write(line)
-                        self.wfile.flush()
-                else:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                try:
+                    if content_type.startswith("text/event-stream"):
+                        for line in resp:
+                            self.wfile.write(line)
+                            self.wfile.flush()
+                    else:
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 self.close_connection = True
         except urllib.error.HTTPError as exc:
             data = exc.read()
@@ -453,7 +587,34 @@ def proxy_is_running(host: str, port: int) -> bool:
         return False
 
 
-def start_proxy(host: str, port: int) -> None:
+def stop_proxy() -> None:
+    pid_path = state_dir() / "proxy.pid"
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    try:
+        pid_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def start_proxy(host: str, port: int, restart: bool = False) -> None:
+    if restart:
+        stop_proxy()
     if proxy_is_running(host, port):
         return
     log_path = state_dir() / "proxy.log"
@@ -514,12 +675,48 @@ def parse_models(values: list[str] | None) -> list[Any]:
     return models
 
 
+def parse_model_maps(values: list[str] | None) -> tuple[list[Any], dict[str, str]]:
+    if not values:
+        return DEFAULT_MODELS, dict(DEFAULT_ROUTE_MODEL_MAP)
+
+    models: list[Any] = []
+    route_model_map: dict[str, str] = {}
+    if len(values) > len(DEFAULT_CLAUDE_ROUTE_MODELS):
+        raise LaunchError(f"Only {len(DEFAULT_CLAUDE_ROUTE_MODELS)} custom model mappings are available by default")
+
+    for index, value in enumerate(values):
+        label, sep, upstream = value.partition("=")
+        if not sep or not label.strip() or not upstream.strip():
+            raise LaunchError("Use --model-map DISPLAY_NAME=UPSTREAM, for example 'Claude Mythos=deepseek-v4-pro'")
+
+        route = DEFAULT_CLAUDE_ROUTE_MODELS[index]
+        label = label.strip()
+        upstream = upstream.strip()
+        if not upstream:
+            raise LaunchError("Model map upstream value cannot be empty")
+
+        model: dict[str, Any] = {"name": route, "labelOverride": label}
+        models.append(model)
+        route_model_map[route] = upstream
+
+    return models, route_model_map
+
+
 def normalize_api_key(value: str) -> str:
     value = value.strip()
     prefix = "bearer "
     if value.lower().startswith(prefix):
         return value[len(prefix) :].strip()
     return value
+
+
+def validate_api_key(value: str) -> str:
+    key = normalize_api_key(value)
+    if not key.startswith("sk-"):
+        raise LaunchError("DeepSeek API key must start with sk-. Pass the real key with --api-key or set DEEPSEEK_API_KEY.")
+    if "*" in key or "..." in key:
+        raise LaunchError("DeepSeek API key looks masked. Pass the full real key with --api-key or set DEEPSEEK_API_KEY.")
+    return key
 
 
 def main() -> int:
@@ -546,7 +743,16 @@ def main() -> int:
         "--model",
         action="append",
         dest="models",
-        help="Model to expose in Claude Desktop. Repeat to add more. Defaults to DeepSeek V4 models.",
+        help="Anthropic route model to expose in Claude Desktop. Repeat to add more. Defaults to claude-sonnet-4-5.",
+    )
+    parser.add_argument(
+        "--model-map",
+        action="append",
+        dest="model_maps",
+        help=(
+            "Show DISPLAY_NAME in Claude Desktop and forward it to UPSTREAM. "
+            "Example: 'Claude Mythos Flash=deepseek-v4-flash'"
+        ),
     )
     parser.add_argument("--restore", action="store_true", help="Restore Claude Desktop to normal 1P mode")
     parser.add_argument("--no-launch", action="store_true", help="Write config but do not open Claude Desktop")
@@ -556,6 +762,9 @@ def main() -> int:
 
     if args.serve_proxy:
         return serve_proxy(args.proxy_host, args.proxy_port)
+
+    if args.models and args.model_maps:
+        raise LaunchError("Use either --model or --model-map, not both")
 
     if not args.base_url.startswith("https://"):
         raise LaunchError("DeepSeek base URL must be https://")
@@ -573,17 +782,40 @@ def main() -> int:
     else:
         gateway_base_url = args.base_url.rstrip("/")
         if not args.direct:
+            if args.model_maps:
+                models, route_model_map = parse_model_maps(args.model_maps)
+            else:
+                models = parse_models(args.models)
+                if args.models:
+                    route_model_map = {
+                        canonical_route_model(model["name"] if isinstance(model, dict) else model): DEFAULT_DEEPSEEK_MODEL
+                        for model in models
+                        if is_claude_route_model(model["name"] if isinstance(model, dict) else model)
+                    } or dict(DEFAULT_ROUTE_MODEL_MAP)
+                else:
+                    route_model_map = dict(DEFAULT_ROUTE_MODEL_MAP)
             if not args.dry_run:
-                start_proxy(args.proxy_host, args.proxy_port)
+                write_route_model_map(route_model_map, args.dry_run)
+            if not args.dry_run:
+                start_proxy(args.proxy_host, args.proxy_port, restart=True)
             gateway_base_url = f"http://{args.proxy_host}:{args.proxy_port}"
+        else:
+            models = parse_models(args.models)
         set_deployment_mode(normal_root / "claude_desktop_config.json", "3p", args.dry_run)
         set_deployment_mode(third_party_root / "claude_desktop_config.json", "3p", args.dry_run)
+        managed_mcp_servers = apply_cowork_auto_mode_config(
+            normal_root / "claude_desktop_config.json", args.dry_run
+        )
+        managed_mcp_servers = apply_cowork_auto_mode_config(
+            third_party_root / "claude_desktop_config.json", args.dry_run
+        ) or managed_mcp_servers
         apply_profile(
             third_party_root=third_party_root,
-            api_key=normalize_api_key(args.api_key),
+            api_key=validate_api_key(args.api_key),
             base_url=gateway_base_url,
             auth_scheme=args.auth_scheme,
-            models=parse_models(args.models),
+            models=models,
+            managed_mcp_servers=managed_mcp_servers,
             dry_run=args.dry_run,
         )
         print("Claude Desktop profile changed to DeepSeek Cloud API.")

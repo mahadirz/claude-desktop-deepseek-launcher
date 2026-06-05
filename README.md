@@ -2,9 +2,9 @@
 
 Launch Claude Desktop in Cowork 3P mode with DeepSeek Cloud API.
 
-This project mirrors the useful part of `ollama launch claude-desktop`: it writes Claude Desktop's 3P profile files, applies a gateway provider, starts a small local compatibility proxy, and opens or restarts Claude Desktop.
+This project writes Claude Desktop's 3P profile files, applies a gateway provider, starts a small local compatibility proxy, and opens or restarts Claude Desktop.
 
-The proxy is needed because Claude Desktop sends some Anthropic/Ollama-style request fields that DeepSeek validates more strictly. In particular, it normalizes `user_id` / `userid` values before forwarding requests to DeepSeek's Anthropic-compatible endpoint.
+The proxy is needed because Claude Desktop sends some Anthropic-compatible request fields that DeepSeek validates more strictly. In particular, it normalizes `user_id` / `userid` values before forwarding requests to DeepSeek's Anthropic-compatible endpoint.
 
 ## Status
 
@@ -35,12 +35,11 @@ export DEEPSEEK_API_KEY="sk-..."
 python3 launch_claude_desktop_deepseek.py --yes
 ```
 
-Claude Desktop should open with the DeepSeek model picker entries:
+Claude Desktop should open with a Claude route model. The local proxy maps that route to DeepSeek before forwarding the request:
 
 ```text
-DeepSeek 4 Pro
-DeepSeek 4 Pro 1M
-DeepSeek 4 Flash
+Claude-Mythos
+Claude-Mythos 1M
 ```
 
 Start a new conversation and send a prompt.
@@ -124,13 +123,28 @@ Use a different local proxy port:
 python3 launch_claude_desktop_deepseek.py --api-key "sk-..." --proxy-port 17632 --yes
 ```
 
-Expose custom models:
+Define custom Claude Desktop model names and map them to DeepSeek upstream models:
 
 ```bash
 python3 launch_claude_desktop_deepseek.py \
   --api-key "sk-..." \
-  --model deepseek-v4-pro \
-  --model deepseek-v4-flash \
+  --model-map "Claude Mythos Flash=deepseek-v4-flash" \
+  --model-map "Claude Mythos=deepseek-v4-pro" \
+  --yes
+```
+
+The `--model-map` format is `DISPLAY_NAME=DEEPSEEK_MODEL`. Claude Desktop still requires valid Anthropic route names internally, so the launcher assigns hidden Claude routes and uses `labelOverride` for the names you see in the picker.
+
+If setup says a configured model was not returned by discovery, rerun the latest launcher. The launcher writes the model route map and restarts the local proxy so `/v1/models` returns the same hidden routes that Claude Desktop is configured to use.
+
+The launcher also enables Cowork Auto Mode settings in Claude Desktop's 3P config. It sets `autoModeEnabled: true`, turns on the existing account permission bypass entries, and mirrors configured MCP servers into `managedMcpServers` with `toolPolicy` entries based on each server's `alwaysAllow` list.
+
+Expose custom Anthropic route models:
+
+```bash
+python3 launch_claude_desktop_deepseek.py \
+  --api-key "sk-..." \
+  --model claude-sonnet-4-5 \
   --yes
 ```
 
@@ -171,16 +185,19 @@ The default local proxy fixes those compatibility issues by:
 - handling Claude Desktop's `/v1/messages/count_tokens` calls locally
 - flushing streamed responses and closing proxy connections cleanly
 - sanitizing `user_id` and `userid` values to DeepSeek's allowed pattern
+- advertising valid Anthropic route names to Claude Desktop while rewriting those routes to DeepSeek upstream model names
 
 ## Troubleshooting
 
-If Claude Desktop still shows duplicate models, fully quit and reopen it. The launcher should advertise only `deepseek-v4-pro` with `supports1m: true` plus `deepseek-v4-flash`.
+If Claude Desktop says `configured model "deepseek-v4-pro" is not an Anthropic model`, rerun the latest launcher. New Claude Desktop versions require `inferenceModels` to use Anthropic route names such as `claude-sonnet-4-5`; the proxy rewrites that route to DeepSeek upstream.
 
 If authentication fails, make sure your key is set as `sk-...`, not `Bearer sk-...`:
 
 ```bash
 export DEEPSEEK_API_KEY="sk-..."
 ```
+
+Do not paste Claude Desktop's masked error text such as `****-...` back into setup. The launcher requires the full real DeepSeek API key and strips a `Bearer ` prefix automatically if you include one.
 
 If the proxy fails to start, check the log:
 
@@ -195,10 +212,6 @@ If Claude Desktop keeps showing an old failed response, start a new conversation
 The launcher stores the DeepSeek API key in Claude Desktop's local 3P profile file because Claude Desktop expects a gateway credential there. Treat your Claude app data directory as secret-bearing local state.
 
 Do not commit local Claude config files, `.env` files, logs, screenshots containing keys, or terminal output containing keys.
-
-## Related Behavior
-
-`ollama launch claude-desktop` configures Claude Desktop's Cowork 3P mode and writes an Ollama gateway profile. This launcher uses the same broad profile-file approach, but targets DeepSeek Cloud API through a compatibility proxy.
 
 ## License
 
